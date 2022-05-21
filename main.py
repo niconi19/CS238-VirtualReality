@@ -14,13 +14,13 @@ import utils
 import losses
 
 parser = argparse.ArgumentParser()
-parser.add_argument('content_img_file', type=str, help='Content image file')
-parser.add_argument('style_img_file', type=str, help='Style image file')
-parser.add_argument('--img_size', '-s', type=int, default=512,
+parser.add_argument('--content_img_file', type=str, default='images/gy2.jpg', help='Content image file')
+parser.add_argument('--style_img_file', type=str, default='images/starry_night3.jpg', help='Style image file')
+parser.add_argument('--img_size', '-s', type=int, default=512, # 512
                     help='The smaller dimension of content image is resized into this size. Default: 512.')
 parser.add_argument('--canvas_color', default='gray', type=str,
                     help='Canvas background color (`gray` (default), `white`, `black` or `noise`).')
-parser.add_argument('--num_strokes', default=10000, type=int,
+parser.add_argument('--num_strokes', default=20000, type=int,
                     help='Number of strokes to draw. Default: 5000.')
 parser.add_argument('--samples_per_curve', default=20, type=int,
                     help='Number of points to sample per parametrized curve. Default: 10.')
@@ -54,8 +54,8 @@ device = torch.device(args.device)
 
 # desired size of the output image
 imsize = args.img_size
-content_img = utils.image_loader(content_img_file, imsize, device)
-style_img = utils.image_loader(style_img_file, imsize, device)
+content_img = utils.image_loader(content_img_file, imsize, device) # imsize
+style_img = utils.image_loader(style_img_file, imsize, device) # 224
 output_name = f'{os.path.basename(content_img_file).split(".")[0]}-{os.path.basename(style_img_file).split(".")[0]}'
 
 # desired depth layers to compute style/content losses :
@@ -70,14 +70,21 @@ num_strokes = args.num_strokes
 samples_per_curve = args.samples_per_curve
 brushes_per_pixel = args.brushes_per_pixel
 _, _, H, W = content_img.shape
+print(content_img.shape, style_img.shape)
 canvas_height = H
 canvas_width = W
 length_scale = 1.1
 width_scale = 0.1
 
+# additional options
+optimizer_choice = ['Adam', 'RMSProp'][1]
+decreasing_learning_rate = 0.9  # 'None' if not used
+shape_lr = 5e-3
+color_lr = 1e-2
+dist_index = 2
 
 # 笔画的风格化
-def run_stroke_style_transfer(num_steps=100, style_weight=3., content_weight=1., tv_weight=0.008, curv_weight=4):
+def run_stroke_style_transfer(num_steps=30, style_weight=3., content_weight=1., tv_weight=0.008, curv_weight=4):
     # 用于计算content loss和style loss
     vgg_loss = losses.StyleTransferLosses(vgg_weight_file, content_img, style_img,
                                           bs_content_layers, bs_style_layers, scale_by_y=True)
@@ -91,9 +98,16 @@ def run_stroke_style_transfer(num_steps=100, style_weight=3., content_weight=1.,
                                       content_img=content_img[0].permute(1, 2, 0).cpu().numpy())
     bs_renderer.to(device)
 
-    optimizer = optim.Adam([bs_renderer.location, bs_renderer.curve_s, bs_renderer.curve_e,
-                            bs_renderer.curve_c, bs_renderer.width], lr=1e-1)
-    optimizer_color = optim.Adam([bs_renderer.color], lr=1e-2)
+    if optimizer_choice == 'Adam':
+        optimizer = optim.Adam([bs_renderer.location, bs_renderer.curve_s, bs_renderer.curve_e,
+                                bs_renderer.curve_c, bs_renderer.width], lr=shape_lr)
+        optimizer_color = optim.Adam([bs_renderer.color], lr=color_lr)
+    elif optimizer_choice == 'RMSProp':
+        optimizer = optim.RMSprop([bs_renderer.location, bs_renderer.curve_s, bs_renderer.curve_e,
+                                   bs_renderer.curve_c, bs_renderer.width], lr=shape_lr)
+        optimizer_color = optim.RMSprop([bs_renderer.color], lr=color_lr)
+    else:
+        raise NotImplementedError("Optimizer not set")
 
     logger.info('Optimizing brushstroke-styled canvas..')
     for _ in mon.iter_batch(range(num_steps)):
@@ -106,9 +120,13 @@ def run_stroke_style_transfer(num_steps=100, style_weight=3., content_weight=1.,
         feature_weight = 5
         feature_score = feature_weight * feature_loss.compute(input_img)
         # style_core: 风格化评价 content_score: 还原度评价 tv_score: 笔画分布评价 curv_score: 笔画弯曲程度评价
-        content_score, style_score = vgg_loss(input_img)
+        _, style_score = vgg_loss(input_img)    # content_score, style_score = vgg_loss(input_img)
+        # modified content score
+        img1, img2 = T.squeeze(T.max(input_img, dim=1)[0]), T.squeeze(T.max(content_img, dim=1)[0])
+        dist = T.nn.PairwiseDistance(p=dist_index)
+        content_score = dist(img1, img2).mean()
         style_score *= style_weight
-        content_score *= content_weight
+        # content_score *= content_weight
         tv_score = tv_weight * losses.total_variation_loss(bs_renderer.location, bs_renderer.curve_s,
                                                            bs_renderer.curve_e, K=10)
         curv_score = curv_weight * losses.curvature_loss(bs_renderer.curve_s, bs_renderer.curve_e, bs_renderer.curve_c)
@@ -128,22 +146,35 @@ def run_stroke_style_transfer(num_steps=100, style_weight=3., content_weight=1.,
         if mon.iter % mon.print_freq == 0:
             mon.imwrite('stroke stylized', input_img)
 
+        # decreasing learning rate
+        if decreasing_learning_rate:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] *= decreasing_learning_rate
+            for param_group in optimizer_color.param_groups:
+                param_group['lr'] *= decreasing_learning_rate
+
     with T.no_grad():
         return bs_renderer()
 
 
 # 像素级优化
-def run_style_transfer(input_img: T.Tensor, num_steps=100, style_weight=10000., content_weight=1., tv_weight=0):
+def run_style_transfer(input_img: T.Tensor, num_steps=30, style_weight=10000., content_weight=1., tv_weight=0):
     # input size of [1, 3, 1364, 1024]
     input_img = input_img.detach()[None].permute(0, 3, 1, 2).contiguous()
-    input_img = F.resize(input_img, imsize)
+    input_img = F.resize(input_img, 512)#1024)
     vgg_loss = losses.StyleTransferLosses(vgg_weight_file, input_img, style_img,
                                           px_content_layers, px_style_layers)
     vgg_loss.to(device).eval()
     input_img = T.nn.Parameter(input_img, requires_grad=True)
     feature_loss = feature.feature_loss(input_img)
 
-    optimizer = optim.Adam([input_img], lr=1e-3)
+    if optimizer_choice == 'Adam':
+        optimizer = optim.Adam([input_img], lr=1e-3)
+    elif optimizer_choice == 'RMSProp':
+        optimizer = optim.RMSprop([input_img], lr=1e-3)
+    else:
+        raise NotImplementedError("Optimizer not set")
+
     logger.info('Optimizing pixel-wise canvas..')
     for _ in mon.iter_batch(range(num_steps)):
         optimizer.zero_grad()
@@ -157,6 +188,11 @@ def run_style_transfer(input_img: T.Tensor, num_steps=100, style_weight=10000., 
         loss = style_score + content_score + tv_score + feature_score
         loss.backward(inputs=[input_img])
         optimizer.step()
+
+        # update learning rate
+        if decreasing_learning_rate:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] *= decreasing_learning_rate
 
         # plot some stuffs
         mon.plot('feature loss', feature_score)
